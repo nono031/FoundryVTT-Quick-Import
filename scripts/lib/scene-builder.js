@@ -10,6 +10,19 @@
 /** Module identifier for console logging */
 const MODULE_LOG_PREFIX = 'Quick Battlemap Importer';
 
+/**
+ * Compatibility wrapper for the `duplicate()` utility.
+ * Foundry v13+ moved it under `foundry.utils.duplicate`; the bare global
+ * was removed in v14.
+ * @param {*} value
+ * @returns {*} Deep copy of the value
+ */
+function duplicate(value) {
+    return (typeof foundry !== 'undefined' && foundry.utils?.duplicate)
+        ? foundry.utils.duplicate(value)
+        : (globalThis.duplicate ? globalThis.duplicate(value) : JSON.parse(JSON.stringify(value)));
+}
+
 /** Maximum time to wait for canvas to be ready (milliseconds) */
 const CANVAS_READY_TIMEOUT_MS = 8000;
 
@@ -73,25 +86,84 @@ export class SceneBuilder {
      * });
      */
     async createScene(options) {
+        // Build the scene document data.
+        // v10-v13 use img/background/globalLight/darkness directly.
+        // v14 moved background to the embedded Level and lighting to `environment`.
+        // NB: game.version is a string like "14" or "14.292"; parse the major version properly.
+        const isV14Plus = (Number.parseInt(String(game.version).split(".")[0], 10) || 0) >= 14;
         const sceneDocumentData = {
             name: options.sceneName,
-            img: options.backgroundPath,
-            background: { src: options.backgroundPath },
             width: options.width,
             height: options.height,
             padding: options.padding ?? 0,
-            backgroundColor: options.backgroundColor ?? '#000000',
-            globalLight: options.globalLight ?? false,
-            darkness: options.darkness ?? 0
         };
 
+        if (!isV14Plus) {
+            // v10-v13: background and lighting are top-level scene fields
+            sceneDocumentData.img = options.backgroundPath;
+            sceneDocumentData.background = { src: options.backgroundPath };
+            sceneDocumentData.backgroundColor = options.backgroundColor ?? '#000000';
+            sceneDocumentData.globalLight = options.globalLight ?? false;
+            sceneDocumentData.darkness = options.darkness ?? 0;
+        } else {
+            // v14+: lighting goes into the environment object
+            sceneDocumentData.environment = {
+                globalLight: { enabled: options.globalLight ?? false },
+                darknessLevel: options.darkness ?? 0,
+            };
+        }
+
         const createdScene = await Scene.create(sceneDocumentData);
-        
+
+        // v14+: the background is stored on the embedded Level document
+        if (isV14Plus) {
+            await this.ensureLevelBackground(createdScene, options.backgroundPath);
+        }
+
         if (this.isDebugLoggingEnabled) {
             console.log(`${MODULE_LOG_PREFIX} | Created scene:`, createdScene.name);
         }
 
         return createdScene;
+    }
+
+    /**
+     * Ensure the scene's default Level has the background set (v14+).
+     * In v14 the background moved from `scene.img` to the embedded
+     * `Level` document's `background.src` field.
+     *
+     * @param {Scene} scene - The created scene
+     * @param {string} backgroundPath - Path to the background image
+     */
+    async ensureLevelBackground(scene, backgroundPath) {
+        try {
+            // The default Level may not be attached to the Scene document right
+            // after Scene.create(); poll briefly until it is available.
+            let defaultLevel = null;
+            const deadline = Date.now() + 3000;
+            while (Date.now() < deadline) {
+                const levels = scene.levels;
+                if (levels && levels.size > 0) {
+                    defaultLevel = levels.contents?.[0] || Array.from(levels)[0];
+                    if (defaultLevel) break;
+                }
+                await this.delay(100);
+            }
+            if (!defaultLevel) {
+                console.error(`${MODULE_LOG_PREFIX} | ensureLevelBackground failed: scene has no embedded Level after 3s`, scene.id);
+                return;
+            }
+            const currentBg = defaultLevel.background?.src;
+            if (!currentBg) {
+                await defaultLevel.update({ 'background.src': backgroundPath });
+                if (this.isDebugLoggingEnabled) {
+                    console.log(`${MODULE_LOG_PREFIX} | Set Level background:`, backgroundPath);
+                }
+            }
+        } catch (e) {
+            // v10-v13 scenes don't have embedded levels – ignore
+            console.error(`${MODULE_LOG_PREFIX} | ensureLevelBackground error:`, e);
+        }
     }
 
     /**
@@ -101,7 +173,16 @@ export class SceneBuilder {
      * @returns {Promise<void>} Resolves when canvas is ready
      */
     async activateAndWaitForCanvas(scene) {
-        await scene.activate();
+        try {
+            await scene.activate();
+        } catch (activateError) {
+            // v12+ prefers the navigation API; fall back gracefully
+            if (typeof game.scenes.viewScene === 'function') {
+                await game.scenes.viewScene(scene);
+            } else {
+                throw activateError;
+            }
+        }
         await this.waitForCanvasReady(scene);
     }
 
@@ -187,6 +268,10 @@ export class SceneBuilder {
      * @param {GridSettings} gridSettings - Grid settings to apply
      */
     async applyObjectGridSettings(scene, snapshot, gridSettings) {
+        const offsetX = gridSettings.offset?.x ?? 0;
+        const offsetY = gridSettings.offset?.y ?? 0;
+        // NB: game.version is a string like "14" or "14.292"; parse the major version properly.
+        const isV14Plus = (Number.parseInt(String(game.version).split(".")[0], 10) || 0) >= 14;
         const gridUpdateData = {
             ...(snapshot.grid || {}),
             size: gridSettings.size,
@@ -194,15 +279,20 @@ export class SceneBuilder {
             distance: gridSettings.distance,
             units: gridSettings.units,
             color: gridSettings.color,
-            alpha: gridSettings.alpha,
-            offset: {
-                x: gridSettings.offset?.x ?? 0,
-                y: gridSettings.offset?.y ?? 0
-            }
+            alpha: gridSettings.alpha
         };
+        const sceneUpdateData = { grid: gridUpdateData };
+        // v14 uses top-level shiftX/shiftY scene fields for grid offset;
+        // v10-v13 used a nested grid.offset object.
+        if (isV14Plus) {
+            sceneUpdateData.shiftX = offsetX;
+            sceneUpdateData.shiftY = offsetY;
+        } else {
+            gridUpdateData.offset = { x: offsetX, y: offsetY };
+        }
 
         try {
-            await scene.update({ grid: gridUpdateData });
+            await scene.update(sceneUpdateData);
         } catch (updateError) {
             console.warn(`${MODULE_LOG_PREFIX} | Grid object update failed; using legacy format`, updateError);
             await this.applyLegacyGridSettings(scene, gridSettings);

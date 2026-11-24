@@ -14,6 +14,18 @@ const MODULE_LOG_PREFIX = 'Quick Battlemap Importer';
 const STORAGE_SOURCE = 'data';
 
 /**
+ * Resolve the FilePicker implementation, compatible with v10-v12 (global
+ * FilePicker) and v13+ (namespaced under foundry.applications.apps).
+ * @returns {Object} The FilePicker implementation
+ */
+function getFilePicker() {
+    const ns = globalThis.foundry?.applications?.apps?.FilePicker;
+    if (ns?.implementation) return ns.implementation;
+    if (ns) return ns;
+    return globalThis.FilePicker;
+}
+
+/**
  * @typedef {Object} BackgroundMediaData
  * @property {string} data - Base64 data URL or blob URL for the media
  * @property {string} filename - Original filename of the media
@@ -59,7 +71,7 @@ export class MediaStorageService {
             await this.ensureDirectoryExists(STORAGE_SOURCE, targetDirectory);
 
             // Upload the file
-            const uploadResult = await FilePicker.upload(
+            const uploadResult = await getFilePicker().upload(
                 STORAGE_SOURCE, 
                 targetDirectory, 
                 fileToUpload, 
@@ -130,7 +142,7 @@ export class MediaStorageService {
     async ensureDirectoryExists(storageSource, directoryPath) {
         try {
             // Try to browse the directory to see if it exists
-            await FilePicker.browse(storageSource, directoryPath);
+            await getFilePicker().browse(storageSource, directoryPath);
         } catch (_browseError) {
             // Directory doesn't exist, try to create it
             await this.createDirectorySafely(storageSource, directoryPath);
@@ -146,7 +158,7 @@ export class MediaStorageService {
      */
     async createDirectorySafely(storageSource, directoryPath) {
         try {
-            await FilePicker.createDirectory(storageSource, directoryPath, {});
+            await getFilePicker().createDirectory(storageSource, directoryPath, {});
         } catch (createError) {
             // EEXIST means directory was created by another request - that's fine
             const errorMessage = String(createError || '');
